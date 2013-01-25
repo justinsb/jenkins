@@ -24,6 +24,8 @@
 package hudson.model;
 
 import com.google.common.base.Function;
+import com.google.common.base.Predicate;
+import com.google.common.cache.Cache;
 import com.google.common.collect.Collections2;
 import com.infradna.tool.bridge_method_injector.WithBridgeMethods;
 import hudson.EnvVars;
@@ -60,6 +62,7 @@ import hudson.util.TextFile;
 import hudson.widgets.HistoryWidget;
 import hudson.widgets.HistoryWidget.Adapter;
 import hudson.widgets.Widget;
+import jenkins.model.Caching;
 import jenkins.model.Jenkins;
 import jenkins.model.ProjectNamingStrategy;
 import jenkins.security.HexStringConfidentialKey;
@@ -755,6 +758,60 @@ public abstract class Job<JobT extends Job<JobT, RunT>, RunT extends Run<JobT, R
     }
 
     /**
+     * Helper function that walks the chain of builds, looking for the most
+     * recent one that matches a predicate. This takes unbounded time, so we
+     * cache results.
+     */
+    protected RunT walkChain(String cachePrefix, Predicate<RunT> predicate) {
+        Cache<String, Integer> cache = Caching.getCacheFor(this);
+
+        RunT cacheAs = null;
+        RunT foundAt = null;
+
+        RunT i = getLastBuild();
+        while (i != null) {
+            if (predicate.apply(i)) {
+                break;
+            }
+
+            // Only cache / check when not building, so status won't change
+            if (!i.isBuilding()) {
+                // Cache on the newest build we can
+                if (cacheAs == null) {
+                    cacheAs = i;
+                }
+
+                String cacheKey = cachePrefix + "::" + i.getUrl();
+                Integer cached = cache.getIfPresent(cacheKey);
+                if (cached != null) {
+                    if (cached.intValue() == 0) {
+                        foundAt = i;
+                        i = null;
+                        break;
+                    } else {
+                        RunT b = getBuildByNumber(cached);
+                        if (b != null) {
+                            foundAt = i;
+                            i = b;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            i = i.getPreviousBuild();
+        }
+
+        if (foundAt != cacheAs && cacheAs != null)
+        {
+            String cacheKey = cachePrefix + "::" + cacheAs.getUrl();
+            cache.put(cacheKey, i != null ? i.getNumber() : 0);
+        }
+
+        return i;
+    }
+
+    /**
      * Returns the last successful build, if any. Otherwise null. A successful build
      * would include either {@link Result#SUCCESS} or {@link Result#UNSTABLE}.
      * 
@@ -763,13 +820,16 @@ public abstract class Job<JobT extends Job<JobT, RunT>, RunT extends Run<JobT, R
     @Exported
     @QuickSilver
     public RunT getLastSuccessfulBuild() {
-        RunT r = getLastBuild();
-        // temporary hack till we figure out what's causing this bug
-        while (r != null
-                && (r.isBuilding() || r.getResult() == null || r.getResult()
-                        .isWorseThan(Result.UNSTABLE)))
-            r = r.getPreviousBuild();
-        return r;
+        return walkChain(Job.class.getName() + "::getLastSuccessfulBuild",
+                new Predicate<RunT>() {
+                    @Override
+                    public boolean apply(RunT r) {
+                        // temporary hack till we figure out what's causing this bug
+                        return !r.isBuilding()
+                               && r.getResult() != null
+                               && !r.getResult().isWorseThan(Result.UNSTABLE);
+                    }
+                });
     }
 
     /**
@@ -779,11 +839,13 @@ public abstract class Job<JobT extends Job<JobT, RunT>, RunT extends Run<JobT, R
     @Exported
     @QuickSilver
     public RunT getLastUnsuccessfulBuild() {
-        RunT r = getLastBuild();
-        while (r != null
-                && (r.isBuilding() || r.getResult() == Result.SUCCESS))
-            r = r.getPreviousBuild();
-        return r;
+        return walkChain(Job.class.getName() + "::getLastUnsuccessfulBuild",
+                new Predicate<RunT>() {
+                    @Override
+                    public boolean apply(RunT r) {
+                        return !r.isBuilding() && r.getResult() != Result.SUCCESS;
+                    }
+                });
     }
 
     /**
@@ -793,11 +855,13 @@ public abstract class Job<JobT extends Job<JobT, RunT>, RunT extends Run<JobT, R
     @Exported
     @QuickSilver
     public RunT getLastUnstableBuild() {
-        RunT r = getLastBuild();
-        while (r != null
-                && (r.isBuilding() || r.getResult() != Result.UNSTABLE))
-            r = r.getPreviousBuild();
-        return r;
+        return walkChain(Job.class.getName() + "::getLastUnstableBuild",
+                new Predicate<RunT>() {
+                    @Override
+                    public boolean apply(RunT r) {
+                        return !r.isBuilding() && r.getResult() == Result.UNSTABLE;
+                    }
+                });
     }
 
     /**
@@ -807,11 +871,13 @@ public abstract class Job<JobT extends Job<JobT, RunT>, RunT extends Run<JobT, R
     @Exported
     @QuickSilver
     public RunT getLastStableBuild() {
-        RunT r = getLastBuild();
-        while (r != null
-                && (r.isBuilding() || r.getResult().isWorseThan(Result.SUCCESS)))
-            r = r.getPreviousBuild();
-        return r;
+        return walkChain(Job.class.getName() + "::getLastStableBuild",
+                new Predicate<RunT>() {
+                    @Override
+                    public boolean apply(RunT r) {
+                        return !r.isBuilding() && !r.getResult().isWorseThan(Result.SUCCESS);
+                    }
+                });
     }
 
     /**
@@ -820,10 +886,13 @@ public abstract class Job<JobT extends Job<JobT, RunT>, RunT extends Run<JobT, R
     @Exported
     @QuickSilver
     public RunT getLastFailedBuild() {
-        RunT r = getLastBuild();
-        while (r != null && (r.isBuilding() || r.getResult() != Result.FAILURE))
-            r = r.getPreviousBuild();
-        return r;
+        return walkChain(Job.class.getName() + "::getLastFailedBuild",
+                new Predicate<RunT>() {
+                    @Override
+                    public boolean apply(RunT r) {
+                        return !r.isBuilding() && r.getResult() == Result.FAILURE;
+                    }
+                });
     }
 
     /**
