@@ -34,7 +34,6 @@ import hudson.Indenter;
 import hudson.Util;
 import hudson.model.Descriptor.FormException;
 import hudson.model.labels.LabelAtomPropertyDescriptor;
-import hudson.scm.ChangeLogSet;
 import hudson.scm.ChangeLogSet.Entry;
 import hudson.search.CollectionSearchIndex;
 import hudson.search.SearchIndexBuilder;
@@ -54,6 +53,7 @@ import hudson.util.RunList;
 import hudson.util.XStream2;
 import hudson.views.ListViewColumn;
 import hudson.widgets.Widget;
+import jenkins.model.Caching;
 import jenkins.model.Jenkins;
 import jenkins.util.ProgressiveRendering;
 import net.sf.json.JSON;
@@ -81,6 +81,7 @@ import java.io.BufferedInputStream;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.Serializable;
 import java.io.StringWriter;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -653,6 +654,133 @@ public abstract class View extends AbstractModelObject implements AccessControll
         return new AsynchPeople(this);
     }
 
+    static class UserInfoMap {
+        final Map<User, UserInfo> users = new HashMap<User, UserInfo>();
+
+        public List<UserInfo> merge(UserInfoMap map) {
+            List<UserInfo> modified = new ArrayList<UserInfo>();
+
+            for (Map.Entry<User, UserInfo> entry : map.users.entrySet()) {
+                User user = entry.getKey();
+                UserInfo mergeInfo = entry.getValue();
+                UserInfo myInfo = users.get(user);
+                if(myInfo !=null && !myInfo.getLastChange().before(mergeInfo.getLastChange())) {
+                    continue;
+                }
+
+                users.put(user, mergeInfo);
+                modified.add(mergeInfo);
+            }
+
+            return modified;
+        }
+    }
+
+    static class JobUserInfoMap extends UserInfoMap{
+        String avatarSize;
+
+        static class UserInfoMemo implements Serializable {
+            private static final long serialVersionUID = 1L;
+
+            String userId;
+            Calendar lastChange;
+            int buildNumber;
+        }
+
+        static class UserInfoMemoList extends ArrayList<UserInfoMemo> {
+            private static final long serialVersionUID = 1L;
+        }
+
+        final Map<User,UserInfo> users = new HashMap<User,UserInfo>();
+        final Map<String,UserInfoMemo> memoized = new HashMap<String,UserInfoMemo>();
+
+        static final String CACHE_PREFIX = "JobUserInfo::";
+
+        public void merge(User user, AbstractProject<?, ?> p, AbstractBuild<?, ?> build) {
+            UserInfo info = users.get(user);
+            if(info==null) {
+                UserInfo userInfo = new UserInfo(user,p, build.getTimestamp());
+                if (avatarSize != null) {
+                    userInfo.avatar = UserAvatarResolver.resolve(user, avatarSize);
+                }
+
+                users.put(user,userInfo);
+
+                UserInfoMemo memo = new UserInfoMemo();
+                memo.userId = user.getId();
+                memo.buildNumber = build.getNumber();
+                memo.lastChange = build.getTimestamp();
+                memoized.put(memo.userId, memo);
+            } else if(info.getLastChange().before(build.getTimestamp())) {
+                info.project = p;
+                info.lastChange = build.getTimestamp();
+
+                UserInfoMemo memo = memoized.get(user.getId());
+                assert memo != null;
+                if (memo != null) {
+                    memo.buildNumber = build.getNumber();
+                    memo.lastChange = build.getTimestamp();
+                }
+            }
+        }
+
+        boolean shouldMerge(String userId, Calendar lastChange) {
+            UserInfoMemo memo = memoized.get(userId);
+            if (memo == null) {
+                return true;
+            }
+
+            return (memo.lastChange.before(lastChange));
+        }
+
+        private User findUser(AbstractBuild<?, ?> build, String userId) {
+            // A trick: we get the user from the relevant build, rather than
+            // trying to persist or synthesize it
+            for (Entry entry : build.getChangeSet()) {
+                User user = entry.getAuthor();
+                if (userId.equals(user.getId())) {
+                    return user;
+                }
+            }
+            return null;
+        }
+
+        public void memoize(AbstractBuild<?, ?> cacheAs) {
+            String cacheKey = CACHE_PREFIX + cacheAs.getUrl();
+            Caching cache = Caching.getCacheFor(this);
+
+            UserInfoMemoList data = new UserInfoMemoList();
+            data.addAll(this.memoized.values());
+
+            cache.put(cacheKey, data);
+        }
+
+        public boolean unmemoize(AbstractProject<?, ?> job, AbstractBuild<?, ?> build) {
+            String cacheKey = CACHE_PREFIX + build.getUrl();
+            Caching cache = Caching.getCacheFor(this);
+            UserInfoMemoList cached = cache.getIfPresent(cacheKey, UserInfoMemoList.class);
+            if (cached != null) {
+                for (UserInfoMemo memo : cached) {
+                    if (shouldMerge(memo.userId, memo.lastChange)) {
+                        AbstractBuild<?,?> memoBuild = (AbstractBuild<?,?>) job.getBuildByNumber(memo.buildNumber);
+                        // Build could have been deleted
+                        if (memoBuild != null) {
+                            User user = findUser(memoBuild, memo.userId);
+                            assert user != null;
+                            if (user != null) {
+                                merge(user, job, memoBuild);
+                            }
+                        }
+                    }
+                }
+
+                return true;
+            }
+
+            return false;
+        }
+    }
+
     @ExportedBean
     public static final class People  {
         @Exported
@@ -679,29 +807,51 @@ public abstract class View extends AbstractModelObject implements AccessControll
         }
 
         private Map<User,UserInfo> getUserInfo(Collection<? extends Item> items) {
-            Map<User,UserInfo> users = new HashMap<User,UserInfo>();
+            UserInfoMap allUsers = new UserInfoMap();
             for (Item item : items) {
-                for (Job job : item.getAllJobs()) {
+                for (Job<?, ?> job : item.getAllJobs()) {
                     if (job instanceof AbstractProject) {
                         AbstractProject<?,?> p = (AbstractProject) job;
-                        for (AbstractBuild<?,?> build : p.getBuilds()) {
+
+                        JobUserInfoMap jobUsers = new JobUserInfoMap();
+                        // Note no avatars here (not sure why!)
+
+                        AbstractBuild<?,?> cacheAs = null;
+                        AbstractBuild<?,?> foundAt = null;
+
+                        AbstractBuild<?,?> build = (AbstractBuild<?,?>) job.getLastBuild();
+                        while (build != null) {
                             for (Entry entry : build.getChangeSet()) {
                                 User user = entry.getAuthor();
+                                jobUsers.merge(user, p, build);
+                            }
 
-                                UserInfo info = users.get(user);
-                                if(info==null)
-                                    users.put(user,new UserInfo(user,p,build.getTimestamp()));
-                                else
-                                if(info.getLastChange().before(build.getTimestamp())) {
-                                    info.project = p;
-                                    info.lastChange = build.getTimestamp();
+                            // Only cache / check when not building, so status won't change
+                            if (!build.isBuilding()) {
+                                // Cache on the newest build we can
+                                if (cacheAs == null) {
+                                    cacheAs = build;
+                                }
+
+                                if (jobUsers.unmemoize(p, build)) {
+                                    foundAt = build;
+                                    break;
                                 }
                             }
+
+                            build = build.getPreviousBuild();
                         }
+
+                        if (foundAt != cacheAs && cacheAs != null)
+                        {
+                            jobUsers.memoize(cacheAs);
+                        }
+
+                        allUsers.merge(jobUsers);
                     }
                 }
             }
-            return users;
+            return allUsers.users;
         }
 
         private List<UserInfo> toList(Map<User,UserInfo> users) {
@@ -771,43 +921,78 @@ public abstract class View extends AbstractModelObject implements AccessControll
 
         @Override protected void compute() throws Exception {
             int itemCount = 0;
+
+            UserInfoMap allUsers = new UserInfoMap();
             for (Item item : items) {
                 for (Job<?,?> job : item.getAllJobs()) {
                     if (job instanceof AbstractProject) {
                         AbstractProject<?,?> p = (AbstractProject) job;
-                        RunList<? extends AbstractBuild<?,?>> builds = p.getBuilds();
                         int buildCount = 0;
-                        for (AbstractBuild<?,?> build : builds) {
+
+                        // getBuilds is expensive!
+                        // int projectBuildCount = p.getBuilds().size();
+                        int projectBuildCount = 200;
+
+                        JobUserInfoMap jobUsers = new JobUserInfoMap();
+                        jobUsers.avatarSize = iconSize;
+
+                        AbstractBuild<?,?> cacheAs = null;
+                        AbstractBuild<?,?> foundAt = null;
+
+                        AbstractBuild<?,?> build = (AbstractBuild<?,?>) job.getLastBuild();
+                        while (build != null) {
                             if (canceled()) {
                                 return;
                             }
-                            for (ChangeLogSet.Entry entry : build.getChangeSet()) {
+
+                            for (Entry entry : build.getChangeSet()) {
                                 User user = entry.getAuthor();
-                                UserInfo info = users.get(user);
-                                if (info == null) {
-                                    UserInfo userInfo = new UserInfo(user, p, build.getTimestamp());
-                                    userInfo.avatar = UserAvatarResolver.resolve(user, iconSize);
-                                    synchronized (this) {
-                                        users.put(user, userInfo);
-                                        modified.add(user);
-                                    }
-                                } else if (info.getLastChange().before(build.getTimestamp())) {
-                                    synchronized (this) {
-                                        info.project = p;
-                                        info.lastChange = build.getTimestamp();
-                                        modified.add(user);
-                                    }
+                                jobUsers.merge(user, p, build);
+                            }
+
+                            // Only cache / check when not building, so status won't change
+                            if (!build.isBuilding()) {
+                                // Cache on the newest build we can
+                                if (cacheAs == null) {
+                                    cacheAs = build;
+                                }
+
+                                if (jobUsers.unmemoize(p, build)) {
+                                    foundAt = build;
+                                    break;
                                 }
                             }
+
+                            build = build.getPreviousBuild();
+
                             // XXX consider also adding the user of the UserCause when applicable
                             buildCount++;
-                            progress((itemCount + 1.0 * buildCount / builds.size()) / (items.size() + 1));
+                            double fraction = 1.0 * Math.min(1.0, buildCount / projectBuildCount);
+                            progress((itemCount + fraction) / (items.size() + 1));
+                        }
+
+                        if (foundAt != cacheAs && cacheAs != null)
+                        {
+                            jobUsers.memoize(cacheAs);
+                        }
+
+                        // We only expose the modified list per-project, for simplicity
+                        // We expect memoization to mean that this still happens quickly
+                        List<UserInfo> modifiedList = allUsers.merge(jobUsers);
+                        synchronized (this) {
+                            for (UserInfo userInfo : modifiedList) {
+                                User user = userInfo.getUser();
+                                users.put(user, userInfo);
+                                modified.add(user);
+                            }
                         }
                     }
                 }
+
                 itemCount++;
                 progress(1.0 * itemCount / (items.size() + /* handling User.getAll */1));
             }
+
             if (unknown != null) {
                 if (canceled()) {
                     return;
