@@ -763,7 +763,7 @@ public abstract class Job<JobT extends Job<JobT, RunT>, RunT extends Run<JobT, R
      * cache results.
      */
     protected RunT walkChain(String cachePrefix, Predicate<RunT> predicate) {
-        Cache<String, Integer> cache = Caching.getCacheFor(this);
+        Caching cache = Caching.getCacheFor(this);
 
         RunT cacheAs = null;
         RunT foundAt = null;
@@ -782,7 +782,7 @@ public abstract class Job<JobT extends Job<JobT, RunT>, RunT extends Run<JobT, R
                 }
 
                 String cacheKey = cachePrefix + "::" + i.getUrl();
-                Integer cached = cache.getIfPresent(cacheKey);
+                Integer cached = cache.getIfPresent(cacheKey, Integer.class);
                 if (cached != null) {
                     if (cached.intValue() == 0) {
                         foundAt = i;
