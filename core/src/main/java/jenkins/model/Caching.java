@@ -61,7 +61,7 @@ public class Caching {
                     trySave();
                 }
             }
-        }, SAVE_INTERVAL);
+        }, SAVE_INTERVAL, SAVE_INTERVAL);
     }
 
     public void trySave() {
